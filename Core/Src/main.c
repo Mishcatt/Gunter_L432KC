@@ -52,7 +52,8 @@ enum gunterStates {
 	GUNTER_NOISE,
 	GUNTER_TOUCH,
 	GUNTER_MIDI,
-	GUNTER_CV
+	GUNTER_CV,
+	GUNTER_GATE
 };
 
 enum buttons {
@@ -107,6 +108,8 @@ DMA_HandleTypeDef hdma_adc1;
 
 DAC_HandleTypeDef hdac1;
 
+IWDG_HandleTypeDef hiwdg;
+
 RNG_HandleTypeDef hrng;
 
 TIM_HandleTypeDef htim6;
@@ -130,7 +133,9 @@ volatile int16_t gunterDistortion = 0;
 volatile float gunterClipping = 1.0f;
 volatile int16_t gunterDiminish = 0;
 volatile float gunterPercussion = 1.0f;
-volatile uint16_t gunterPeriod = 1000;
+volatile int32_t gunterEighth = 0;
+volatile int16_t gunterPeriod = 1000;
+volatile int16_t gunterSamplePeriod = 1000;
 volatile float gunterPeriod1000 = 0xfff / 1000;
 volatile float gunterPeriod2000 = 0x1fff / 1000;
 volatile uint16_t gunterPeriodShift = 1000;
@@ -154,6 +159,7 @@ static void MX_TSC_Init(void);
 static void MX_TIM7_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_IWDG_Init(void);
 /* USER CODE BEGIN PFP */
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
@@ -206,6 +212,7 @@ int main(void)
   MX_TIM7_Init();
   MX_USART1_UART_Init();
   MX_TIM6_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
 
 	//HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
@@ -226,6 +233,8 @@ int main(void)
 	{
 		if (gunterADCReady) {
 			gunterADCReady = 0;
+
+			HAL_IWDG_Refresh(&hiwdg);
 
 			if (adcBuffer[ADC_KNOB_1] <= KNOB_1_MAX && adcBuffer[ADC_KNOB_1] >= KNOB_1_MIN) {
 				gunterState = GUNTER_OFF;
@@ -249,11 +258,23 @@ int main(void)
 				gunterState = GUNTER_NOISE;
 			}
 			else if (adcBuffer[ADC_KNOB_1] <= KNOB_8_MAX && adcBuffer[ADC_KNOB_1] >= KNOB_8_MIN) {
-				gunterState = GUNTER_CV;
+				gunterState = GUNTER_MIDI;
 			}
 
-			gunterPeriod = (0xfc4 - adcBuffer[ADC_POT_1]); // TODO: Skalowanie?
+			if (HAL_GPIO_ReadPin(Gate_GPIO_Port, Gate_Pin) == GPIO_PIN_RESET) {
+				gunterState = GUNTER_GATE;
+			}
+
+			if (adcBuffer[ADC_CV] > 0xeff) {
+				gunterPeriod = (0xfc4 - adcBuffer[ADC_POT_1]); // TODO: Skalowanie?
+				gunterSamplePeriod = adcBuffer[ADC_POT_1];
+			} else {
+				gunterPeriod = (0xfc4 - adcBuffer[ADC_POT_1]) - adcBuffer[ADC_CV];
+				gunterSamplePeriod = adcBuffer[ADC_POT_1] - adcBuffer[ADC_CV];
+			}
+
 			if (gunterPeriod < 3) gunterPeriod = 3;
+			if (gunterSamplePeriod < 0) gunterSamplePeriod = 0;
 			//gunterPeriod = 2;
 			gunterPeriod1000 = 4096.0f / gunterPeriod;
 			gunterPeriod2000 = 8192.0f / gunterPeriod;
@@ -267,7 +288,7 @@ int main(void)
 			else {
 				gunterShift = 1.0f;
 			}
-			gunterShift = 1.0f;
+			//gunterShift = 1.0f;
 
 			gunterPeriodShift = gunterPeriod * gunterShift;
 			gunterPeriodShift1000 = 4096.0f / gunterPeriodShift;
@@ -283,15 +304,15 @@ int main(void)
 			else {
 				gunterDistortion = 0;
 			}
-			gunterDistortion = 0;
+			//gunterDistortion = 0;
 
 			gunterClipping = -(gunterDistortion*0.01f) + 1.0f;
 
-			if (adcBuffer[ADC_POT_2] > 0x8ff) {
-				gunterDiminish = adcBuffer[ADC_POT_2] - 0x8ff;
+			if (adcBuffer[ADC_POT_4] > 0x8ff) {
+				gunterDiminish = adcBuffer[ADC_POT_4] - 0x8ff;
 			}
-			else if (adcBuffer[ADC_POT_2] < 0x700) {
-				gunterDiminish = adcBuffer[ADC_POT_2] - 0x700;
+			else if (adcBuffer[ADC_POT_4] < 0x700) {
+				gunterDiminish = adcBuffer[ADC_POT_4] - 0x700;
 			}
 			else {
 				gunterDiminish = 0;
@@ -299,14 +320,24 @@ int main(void)
 			//gunterDiminish = adcBuffer[ADC_POT_2] - 0x7ff;
 			if (gunterDiminish < 0) {
 				gunterPercussion = 1.0f + (gunterDiminish*0.0000005f);
-			} else {
+				gunterEighth = 0;
+			}
+			else if (gunterDiminish > 0){
 				gunterPercussion = 1.0f;
+				gunterEighth = (0x6ff - gunterDiminish) << 4;
+			}
+			else {
+				gunterPercussion = 1.0f;
+				gunterEighth = 0;
 			}
 
+			/*
+			 *  BLOK MARGARYNOWY
+			 */
 			if (gunterState == GUNTER_WENK) {
-				if (adcBuffer[ADC_POT_1] > 0x7ff) {
+				if (gunterSamplePeriod > 0x7ff) {
 					gunterTempDivision = 1024;
-					gunterSampling[0] = (0x800 - (adcBuffer[ADC_POT_1] - 0x7ff)) * (GUNTER_SAMPLING_DEFAULT) * gunterTempDivision;
+					gunterSampling[0] = (0x800 - (gunterSamplePeriod - 0x7ff)) * (GUNTER_SAMPLING_DEFAULT) * gunterTempDivision;
 					gunterSampling[0] /= 0x800;
 					while (gunterSampling[0] >= GUNTER_SAMPLING_MIN*2) {
 						gunterSampling[0] /= 2;
@@ -314,7 +345,7 @@ int main(void)
 					}
 				} else {
 					gunterTempDivision = 2;
-					gunterSampling[0] = (GUNTER_SAMPLING_DEFAULT + ((0x7ff - adcBuffer[ADC_POT_1]) * (0x7ff - adcBuffer[ADC_POT_1]) / 256)) * gunterTempDivision;
+					gunterSampling[0] = (GUNTER_SAMPLING_DEFAULT + ((0x7ff - gunterSamplePeriod) * (0x7ff - gunterSamplePeriod) / 256)) * gunterTempDivision;
 					if (gunterSampling[0] >= GUNTER_SAMPLING_MIN*2) {
 						gunterSampling[0] /= 2;
 						gunterTempDivision /= 2;
@@ -324,7 +355,7 @@ int main(void)
 			}
 			else if (gunterState == GUNTER_SIN) {
 				gunterTempDivision = 1024;
-				gunterSampling[0] = (0x1000 - adcBuffer[ADC_POT_1]) * GUNTER_SAMPLING_DEFAULT * gunterTempDivision;
+				gunterSampling[0] = (0x1000 - gunterSamplePeriod) * GUNTER_SAMPLING_DEFAULT * gunterTempDivision;
 				gunterSampling[0] /= 0x5800;
 				while (gunterSampling[0] >= GUNTER_SAMPLING_MIN*2) {
 					gunterSampling[0] /= 2;
@@ -370,9 +401,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 1;
@@ -594,6 +626,35 @@ static void MX_DAC1_Init(void)
 }
 
 /**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_4;
+  hiwdg.Init.Window = 4095;
+  hiwdg.Init.Reload = 4095;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
+
+}
+
+/**
   * @brief RNG Initialization Function
   * @param None
   * @retval None
@@ -806,6 +867,12 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin : Gate_Pin */
+  GPIO_InitStruct.Pin = Gate_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(Gate_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pin : LD3_Pin */
   GPIO_InitStruct.Pin = LD3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -821,6 +888,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) { // 96 kHz
 	static uint16_t currentSample[2] = {0, 0};
 	static uint16_t currentDistortion[2] = {0, 0};
 	static uint32_t currentNoise[2] = {1, 1};
+	static uint32_t currentEighth[2] = {0, 0};
 	static float currentVolume[2] = {1.0f, 1.0f};
 	int16_t temp[2] = {0, 0};
 
@@ -870,21 +938,32 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) { // 96 kHz
 			temp[0] = sinTable[currentSample[0]];
 		}
 
-		else if (gunterState == GUNTER_OFF) {
+		else if (gunterState == GUNTER_OFF || gunterState == GUNTER_GATE) {
 			currentSample[0] = 0;
 			temp[0] = 0;
+			currentVolume[0] = 0.0f;
+			currentDistortion[0] = 0;
+			currentNoise[0] = 0;
+			currentEighth[0] = 0;
 		}
 
 		currentSample[0] += gunterDivision;
 
 		temp[0] -= 0x7ff;
+
 		if (gunterDistortion < 0) {
 			temp[0] *= gunterClipping;
 		}
 		if (temp[0] > 0x7ff) temp[0] = 0x7ff;
 		else if (temp[0] < -0x7ff) temp[0] = -0x7ff;
-		temp[0] += 0x7ff;
+
 		temp[0] *= currentVolume[0];
+
+		currentEighth[0]++;
+		if (currentEighth[0] >= gunterEighth) currentEighth[0] = 0;
+		if (currentEighth[0] > (gunterEighth >> 2)) temp[0] = 0;
+
+		temp[0] += 0x7ff;
 
 		if (gunterPercussion == 1.0f || currentVolume[0] < 0.1f) {
 			currentVolume[0] = 1.0f;
@@ -920,7 +999,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) { // 96 kHz
 		}
 
 		else if (gunterState == GUNTER_NOISE) {
-			if (currentSample[1] >= gunterPeriod) {
+			if (currentSample[1] >= gunterPeriodShift) {
 				currentSample[1] = 0;
 			}
 			if (currentSample[1] == 0) {
@@ -948,21 +1027,32 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) { // 96 kHz
 			temp[1] = sinTable[currentSample[1]];
 		}
 
-		else if (gunterState == GUNTER_OFF) {
+		else if (gunterState == GUNTER_OFF || gunterState == GUNTER_GATE) {
 			currentSample[1] = 0;
 			temp[1] = 0;
+			currentVolume[1] = 0.0f;
+			currentDistortion[1] = 0;
+			currentNoise[1] = 0;
+			currentEighth[1] = 0;
 		}
 
 		currentSample[1] += gunterDivision;
 
 		temp[1] -= 0x7ff;
+
 		if (gunterDistortion < 0) {
 			temp[1] *= gunterClipping;
 		}
 		if (temp[1] > 0x7ff) temp[1] = 0x7ff;
 		else if (temp[1] < -0x7ff) temp[1] = -0x7ff;
-		temp[1] += 0x7ff;
+
 		temp[1] *= currentVolume[1];
+
+		currentEighth[1]++;
+		if (currentEighth[1] >= gunterEighth) currentEighth[1] = 0;
+		if (currentEighth[1] > (gunterEighth >> 2)) temp[1] = 0;
+
+		temp[1] += 0x7ff;
 
 		if (gunterPercussion == 1.0f || currentVolume[1] < 0.1f) {
 			currentVolume[1] = 1.0f;
